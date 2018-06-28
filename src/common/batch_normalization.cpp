@@ -31,7 +31,7 @@ using namespace mkldnn::impl::types;
 namespace {
 status_t bnrm_desc_init(batch_normalization_desc_t *bnrm_desc,
         prop_kind_t prop_kind, const memory_desc_t *data_desc,
-        const memory_desc_t *diff_data_desc, float epsilon, unsigned flags) {
+        const memory_desc_t *diff_data_desc, float epsilon, unsigned flags, bool mean_variance_fusion, bool norm_fusion) {
     bool args_ok = true
         && !any_null(bnrm_desc, data_desc)
         && one_of(prop_kind, forward_training, forward_inference,
@@ -65,6 +65,10 @@ status_t bnrm_desc_init(batch_normalization_desc_t *bnrm_desc,
 
 
     bd.batch_norm_epsilon = epsilon;
+    bd.mean_variance_fusion = mean_variance_fusion;
+    bd.norm_fusion = norm_fusion;
+    bd.x1_gamma_beta_fusion = mean_variance_fusion;
+    bd.x2_gamma_beta_fusion = norm_fusion;
 
     unsigned bnorm_flags =
         mkldnn_use_global_stats | mkldnn_omit_stats | mkldnn_use_scaleshift;
@@ -87,21 +91,21 @@ status_t bnrm_desc_init(batch_normalization_desc_t *bnrm_desc,
 
 status_t mkldnn_batch_normalization_forward_desc_init(
         batch_normalization_desc_t *bnrm_desc, prop_kind_t prop_kind,
-        const memory_desc_t *data_desc, float epsilon, unsigned flags) {
+        const memory_desc_t *data_desc, float epsilon, unsigned flags, bool mean_variance_fusion, bool norm_fusion) {
     if (!one_of(prop_kind, forward_training, forward_inference))
         return invalid_arguments;
     return bnrm_desc_init(bnrm_desc, prop_kind, data_desc, nullptr,
-            epsilon, flags);
+            epsilon, flags, mean_variance_fusion, norm_fusion);
 }
 
 status_t mkldnn_batch_normalization_backward_desc_init(
         batch_normalization_desc_t *bnrm_desc, prop_kind_t prop_kind,
         const memory_desc_t *diff_data_desc, const memory_desc_t *data_desc,
-        float epsilon, unsigned flags) {
+        float epsilon, unsigned flags, bool x1_gamma_beta_fusion, bool x2_gamma_beta_fusion) {
     if (!one_of(prop_kind, backward, backward_data))
         return invalid_arguments;
     return bnrm_desc_init(bnrm_desc, prop_kind, data_desc, diff_data_desc,
-            epsilon, flags);
+            epsilon, flags, x1_gamma_beta_fusion, x2_gamma_beta_fusion);
 }
 
 // vim: et ts=4 sw=4 cindent cino^=l0,\:0,N-s

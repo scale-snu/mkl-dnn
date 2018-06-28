@@ -18,11 +18,13 @@
 #define JIT_PRIMITIVE_CONF_HPP
 
 #include <stdint.h>
+#include "cpu_barrier.hpp"
 
 namespace mkldnn {
 namespace impl {
 namespace cpu {
 
+namespace barrier = simple_barrier;
 /* convolution */
 enum conv_version_t {ver_unused, ver_fma, ver_4fma, ver_4vnni};
 enum conv_loop_order_t {loop_cgn, loop_gnc, loop_ngc};
@@ -35,6 +37,8 @@ enum {
     FLAG_IC_FIRST = 1 << 4, FLAG_IC_LAST = 1 << 5,
     FLAG_SP_FIRST = 1 << 6, FLAG_SP_LAST = 1 << 7,
     FLAG_REDUCE_FIRST = 1<<8, FLAG_REDUCE_LAST = 1<<9,
+    FLAG_LAST = 1 << 10,
+    FLAG_OH_SECOND = 1 << 11, FLAG_OC_FIRST2 = 1 << 12,
 };
 
 struct jit_conv_conf_t {
@@ -81,6 +85,7 @@ struct jit_conv_conf_t {
     int ur_ow_nsteps;
     data_type_t bia_dt;
     data_type_t dst_dt;
+    int spat_size;
 };
 
 
@@ -134,7 +139,68 @@ struct jit_conv_call_s {
     size_t channel;
     size_t channel_prf;
     size_t oc_blocks;
+    int flag_oc_last;
     int flags;
+    int flag_last;
+    int flag_oc_last_prf;
+    int flag_last_prf;
+    int oh_second_flags;
+
+    const void *scale_shift;
+    const void *prev_mean;
+    const void *prev_var;
+    const void *prev_src;
+    const void *scale_shift_prf;
+    const void *prev_mean_prf;
+    const void *prev_var_prf;
+    const void *prev_src_prf;
+
+    float eps;
+    float one;
+    float eps_prf;
+    float one_prf;
+    float bwd_chan_size;
+
+    // bwd store
+    float *rbuf1;
+    float *rbuf2;
+    const void *relu_src;
+    const void *bn_src;
+    const void *bn_mean;
+    const void *bn_var;
+
+    float *rbuf1_prf;
+    float *rbuf2_prf;
+    const void *relu_src_prf;
+    const void *bn_src_prf;
+    const void *bn_mean_prf;
+
+    size_t coff;
+    size_t coff_prf;
+
+    // bwd reduction
+    float *rbuf1_base;
+    float *rbuf2_base;
+    float *diff_gamma;
+    float *diff_beta;
+    float *chan_size;
+    size_t nthr;
+    size_t ithr;
+    size_t coff_max;
+    size_t base_coff;
+    barrier::ctx_t *barrier;
+
+    const void *bn_var_prf;
+    float *rbuf1_base_prf;
+    float *rbuf2_base_prf;
+    float *diff_gamma_prf;
+    float *diff_beta_prf;
+    float *chan_size_prf;
+    size_t nthr_prf;
+    size_t ithr_prf;
+    size_t coff_max_prf;
+    size_t base_coff_prf;
+    barrier::ctx_t *barrier_prf;
 };
 
 struct jit_1x1_conv_conf_t {
@@ -180,6 +246,10 @@ struct jit_1x1_conv_conf_t {
     bool transpose_src;
     int tr_is;
     int nthr_, nthr_mb_, nthr_g_, nthr_oc_b_, nthr_ic_b_;
+
+    int spat_size;
+    int chan_data_offt;
+
 };
 
 struct jit_gemm_conv_conf_t {
@@ -206,7 +276,39 @@ struct jit_1x1_conv_call_s {
     const void *bcast_data;
     const void *load_data;
     const void *output_data;
+    const void *relu_src;
+    const void *bn_src;
+    const void *bn_mean;
+    const void *bn_var;
     const void *bias_data; // used in forward and backward_weights only
+
+    const void *scale_shift;
+    const void *prev_mean;
+    const void *prev_var;
+    const void *prev_src;
+
+    float eps;
+    float one;
+    float *rbuf1, *rbuf2;
+    float *rbuf1_base, *rbuf2_base;
+
+    float *mean_fusion;
+    float *var_fusion;
+    float *chan_size;
+    size_t nthr;
+    size_t ithr;
+    size_t coff_max;
+    barrier::ctx_t *barrier;
+
+    // bwd norm fusion
+    const void *next_mean;
+    const void *next_var;
+    const void *conv_dst;
+    const void *diff_src;
+    const void *next_scale_shift;
+    const void *diff_gamma;
+    const void *diff_beta;
+    float bwd_chan_size;
 
     size_t load_dim;
     size_t bcast_dim;
@@ -215,6 +317,9 @@ struct jit_1x1_conv_call_s {
     size_t output_stride; // used in backward_weights only
 
     size_t reduce_pos_flag;
+    size_t last_flag;
+    size_t base_coff;
+    size_t coff_thr;
 };
 
 /* pooling */

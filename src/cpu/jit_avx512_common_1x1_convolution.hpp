@@ -119,6 +119,14 @@ struct _jit_avx512_common_1x1_convolution_fwd_t : public cpu_primitive_t {
         kernel_ = new jit_avx512_common_1x1_conv_kernel(conf_.jcp_,
                     *conf_.attr());
         init_rtus_driver<avx512_common>(this);
+        int C = kernel_->jcp.oc;
+        int size_rbuf_ = 2 * omp_get_max_threads() * C;
+
+        rbuf_ = (float *)malloc(size_rbuf_ * sizeof(float), 64);
+        chan_size = (float *)malloc(16 * sizeof(float), 64);
+
+        barriers_ = (barrier::ctx_t *)malloc(1 * sizeof(barrier::ctx_t), 64);
+        barrier::ctx_init(&barriers_[0]);
     }
     ~_jit_avx512_common_1x1_convolution_fwd_t() {
         delete kernel_;
@@ -143,6 +151,9 @@ struct _jit_avx512_common_1x1_convolution_fwd_t : public cpu_primitive_t {
     rtus_driver_t<avx512_common> *rtus_driver_;
     size_t ws_per_thread_;
     src_data_t *scratch_;
+    float *rbuf_;
+    float *chan_size;
+    barrier::ctx_t *barriers_;
 };
 
 using jit_avx512_common_1x1_convolution_fwd_f32_t
@@ -236,6 +247,15 @@ struct _jit_avx512_common_1x1_convolution_bwd_data_t : public cpu_primitive_t {
         kernel_ = new jit_avx512_common_1x1_conv_kernel(conf_.jcp_,
                     *conf_.attr());
         init_rtus_driver<avx512_common>(this);
+
+        int C = kernel_->jcp.ic;
+        int size_rbuf_ = 2 * omp_get_max_threads() * C;
+
+        rbuf_ = (float *)malloc(size_rbuf_ * sizeof(float), 64);
+        chan_size = (float *)malloc(16 * sizeof(float), 64);
+
+        barriers_ = (barrier::ctx_t *)malloc(1 * sizeof(barrier::ctx_t), 64);
+        barrier::ctx_init(&barriers_[0]);
     }
     ~_jit_avx512_common_1x1_convolution_bwd_data_t()
     {
@@ -260,6 +280,9 @@ struct _jit_avx512_common_1x1_convolution_bwd_data_t : public cpu_primitive_t {
     }
 
   private:
+    float *rbuf_;
+    float *chan_size;
+    barrier::ctx_t *barriers_;
     void execute_backward_data();
     pd_t conf_;
     jit_avx512_common_1x1_conv_kernel *kernel_;

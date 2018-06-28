@@ -149,7 +149,7 @@
 namespace Xbyak {
 
 enum {
-	DEFAULT_MAX_CODE_SIZE = 4096,
+	DEFAULT_MAX_CODE_SIZE = 8192,
 	VERSION = 0x5432 /* 0xABCD = A.BC(D) */
 };
 

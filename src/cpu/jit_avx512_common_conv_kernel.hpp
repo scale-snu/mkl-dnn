@@ -59,8 +59,11 @@ private:
     };
 
     reg64_t param = abi_param1;
-    reg64_t reg_inp = r8;
+    // We rearrange registers without conflicts for BatchNorm fusion.
+    reg64_t reg_inp = r9;
+    reg64_t reg_inp_tmp = r12;
     reg64_t reg_ker = r9;
+    reg64_t reg_ker_tmp = r12;
     reg64_t reg_out = r10;
 
     reg64_t reg_inp_prf = r11;
@@ -95,6 +98,31 @@ private:
     reg64_t aux1_reg_inp = rbx;
     reg64_t aux_reg_out = abi_not_param1;
 
+    int stack_space_needed = 112;
+    int ker = 0;
+    int norm_flags = 16;
+    int inp = 32;
+    int prev_var = 48;
+    int prev_src = 64;
+    int scale_shift = 80;
+    int oh_second_flags = 96;
+
+    reg64_t reg_norm_flags_tmp = r12;
+    reg64_t reg_norm_flags = r8;
+    reg64_t reg_oh_second_flags_tmp = r12;
+    reg64_t reg_oh_second_flags = r9;
+
+    using mask_t = const Xbyak::Opmask;
+    mask_t vmask = k7;
+
+    reg64_t reg_prev_mean_tmp = r12;
+    reg64_t reg_prev_var_tmp = r12;
+    reg64_t reg_prev_src = r9;
+    reg64_t aux_reg_prev_src = r8;
+    reg64_t reg_prev_src_tmp = r12;
+    reg64_t reg_scale_shift_tmp = r12;
+
+
     inline Xbyak::Zmm zmm_ker(int i_ic) {
         assert(i_ic < 4);
         return Xbyak::Zmm(ker_reg_base_idx + i_ic);
@@ -110,10 +138,21 @@ private:
     Xbyak::Xmm xmm_relu_ns = Xbyak::Xmm(30);
     Xbyak::Zmm zmm_relu_ns = Xbyak::Zmm(30);
     Xbyak::Zmm zmm_zero = Xbyak::Zmm(31);
+    Xbyak::Zmm vone = Xbyak::Zmm(20);
+    Xbyak::Zmm veps = Xbyak::Zmm(21);
+    Xbyak::Zmm z = Xbyak::Zmm(22);
+    Xbyak::Zmm zmm_zero2 = Xbyak::Zmm(23);
+    Xbyak::Zmm zmean = Xbyak::Zmm(24);
+    Xbyak::Zmm zsqrtvar = Xbyak::Zmm(25);
+    Xbyak::Zmm zgamma = Xbyak::Zmm(26);
+    Xbyak::Zmm zbeta = Xbyak::Zmm(27);
+
+    int chan_data_offt;
 
     inline void prepare_output(int ur_w);
     inline void store_output(int ur_w);
     inline void compute_loop_fma(int ur_w, int pad_l, int pad_r);
+    inline void compute_loop_fma_OC_FIRST(int ur_w, int pad_l, int pad_r);
     inline void compute_loop_4vnni(int ur_w, int pad_l, int pad_r);
     inline void compute_loop_4fma(int ur_w, int pad_l, int pad_r);
     inline void compute_loop_4fma_1st(int ur_w, int pad_l, int pad_r);
@@ -198,13 +237,18 @@ private:
         ker_reg_base_idx = 28,
     };
 
+    // We rearrange registers without conflicts for BatchNorm fusion.
     reg64_t param = abi_param1;
-    reg64_t reg_dst = r8;
+    reg64_t reg_dst_tmp = r8;
+    reg64_t reg_dst = r9;
+    reg64_t reg_ker_tmp = r8;
     reg64_t reg_ker = r9;
     reg64_t reg_src = r10;
 
-    reg64_t reg_dst_prf = r11;
-    reg64_t reg_ker_prf = r12;
+    reg64_t reg_dst_prf_tmp = r8;
+    reg64_t reg_dst_prf = r9;
+    reg64_t reg_ker_prf_tmp = r8;
+    reg64_t reg_ker_prf = r9;
     reg64_t reg_src_prf = r13;
 
     reg64_t aux_reg_dst = r14;
@@ -217,9 +261,100 @@ private:
     reg64_t reg_oi = rbx;
     reg64_t reg_kh = abi_not_param1;
 
-    reg64_t reg_channel = rsi;
+    reg64_t reg_channel_tmp = r8;
+    reg64_t reg_channel = r9;
 
     reg64_t reg_tmp = rbp;
+    reg64_t reg_flag_oc_last_tmp = r8;
+    reg64_t reg_flag_oc_last = r9;
+    reg64_t reg_flag_last_tmp = r8;
+    reg64_t reg_flag_last = r9;
+    reg64_t reg_coff_tmp = r8;
+    reg64_t reg_coff = rsi;
+    reg64_t reg_rbuf1_tmp = r8;
+    reg64_t reg_rbuf1 = r11;
+    reg64_t reg_rbuf2_tmp = r8;
+    reg64_t reg_rbuf2 = r12;
+    reg64_t reg_bn_src_tmp = r8;
+    reg64_t reg_bn_src = r9;
+    reg64_t reg_relu_src_tmp = r8;
+    reg64_t reg_relu_src = r9;
+    reg64_t reg_mean_tmp = r8;
+    reg64_t reg_mean = r9;
+
+    reg64_t reg_rbuf1_base_tmp = r8;
+    reg64_t reg_rbuf1_base = r15;
+    reg64_t reg_rbuf2_base_tmp = r8;
+    reg64_t reg_rbuf2_base = r13;
+    reg64_t reg_diff_gamma_tmp = r8;
+    reg64_t reg_diff_gamma = rbx;
+    reg64_t reg_diff_beta_tmp = r8;
+    reg64_t reg_diff_beta = r10;
+    reg64_t reg_coff_max_tmp = r8;
+    reg64_t reg_coff_max = rdx;
+    reg64_t reg_nthr_tmp = r8;
+    reg64_t reg_nthr = r12;
+    reg64_t reg_ithr_tmp = r8;
+    reg64_t reg_ithr = rbp;
+    reg64_t reg_chan_size_tmp = r8;
+    reg64_t reg_chan_size = r15;
+    reg64_t reg_var_tmp = r8;
+    reg64_t reg_var = r8;
+    reg64_t reg_base_coff_tmp = r8;
+    reg64_t reg_base_coff = rbp;
+    reg64_t reg_barrier_tmp = r8;
+    reg64_t reg_barrier = rax;
+    reg64_t reg_roff = r14;
+    reg64_t reg_ctr = rsi;
+    reg64_t reg_one_tmp =r8;
+    reg64_t reg_eps_tmp =r8;
+
+    int flag_oc_last = 0;
+    int coff = 16;
+    int rbuf1 = 32;
+    int rbuf2 = 48;
+    int bn_src = 64;
+    int relu_src = 80;
+    int mean = 96;
+    int dst = 112;
+    int ker = 128;
+    int dst_prf = 144;
+    int ker_prf = 160;
+    int channel = 172;
+
+    int rbuf1_base = 192;
+    int rbuf2_base = 208;
+    int diff_gamma = 224;
+    int diff_beta = 240;
+    int coff_max = 256;
+    int nthr = 272;
+    int ithr = 288;
+    int chan_size = 304;
+    int var = 320;
+    int base_coff = 336;
+    int barrier = 352;
+    int roff = 368;
+    int ctr = 338;
+    int one = 400;
+    int eps = 416;
+    int flag_last = 432;
+
+    int stack_space_needed = 448;
+
+    Xbyak::Zmm zbn_src   = Xbyak::Zmm(21);
+    Xbyak::Zmm zrelu_src = Xbyak::Zmm(22);
+    Xbyak::Zmm zmean     = Xbyak::Zmm(23);
+    Xbyak::Zmm zd_beta   = Xbyak::Zmm(24);
+    Xbyak::Zmm zd_gamma  = Xbyak::Zmm(25);
+    Xbyak::Zmm ztmp      = Xbyak::Zmm(26);
+    Xbyak::Zmm zmm_zero  = Xbyak::Zmm(27);
+
+    Xbyak::Zmm vone     = Xbyak::Zmm(25);
+    Xbyak::Zmm veps     = Xbyak::Zmm(26);
+    Xbyak::Zmm zsqrtvar = Xbyak::Zmm(27);
+
+    using mask_t = const Xbyak::Opmask;
+    mask_t vmask = k7;
 
     inline Xbyak::Zmm zmm_ker(int i_ic) {
         assert(i_ic < 4);

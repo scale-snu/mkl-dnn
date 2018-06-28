@@ -22,6 +22,7 @@
 
 #include "jit_avx512_common_conv_kernel.hpp"
 
+#include "cpu_barrier.hpp"
 #define GET_OFF(field) offsetof(jit_conv_call_s, field)
 #define KNx_L2_EFFECTIVE_CAPACITY ((512-64)*1024)
 
@@ -41,15 +42,18 @@ inline void pick_loop_order(jit_conv_conf_t &jcp) {
     using namespace prop_kind;
     assert(one_of(jcp.prop_kind,
                 forward_training, forward_inference, backward_data));
-    auto w = (jcp.prop_kind == backward_data) ? jcp.iw : jcp.ow;
-    auto h = (jcp.prop_kind == backward_data) ? jcp.ih : jcp.oh;
+
+    // TODO: We only support loop reordering for DenseNet models.
+    // auto w = (jcp.prop_kind == backward_data) ? jcp.iw : jcp.ow;
+    // auto h = (jcp.prop_kind == backward_data) ? jcp.ih : jcp.oh;
     switch (jcp.ver) {
     case ver_fma:
         jcp.loop_order = loop_cgn;
     case ver_4vnni:
     case ver_4fma:
         jcp.loop_order
-            = (w <= small_spatial && h <= small_spatial) ? loop_cgn : loop_gnc;
+                = loop_gnc;
+        //      = (w <= small_spatial && h <= small_spatial) ? loop_cgn : loop_gnc;
         break;
     default:
         assert(!"unsupported convolution version");
@@ -439,7 +443,11 @@ void jit_avx512_common_conv_fwd_kernel::compute_loop_fma(int ur_w, int pad_l,
             = (prf_ker || prf_inp) ? nstl::max(1, num_fmas / num_prfs) : 1;
     int prf_inst_trigger = (num_fmas % prf_inst_spacing) / 2;
 
+    mov(reg_inp, EVEX_compress_addr(rsp, inp));
     mov(aux_reg_inp, reg_inp);
+    mov(reg_prev_src, EVEX_compress_addr(rsp, prev_src));
+    mov(aux_reg_prev_src, reg_prev_src);
+    mov(reg_ker, EVEX_compress_addr(rsp, ker));
     mov(aux_reg_ker, reg_ker);
 
     prepare_output(ur_w);
@@ -457,6 +465,7 @@ void jit_avx512_common_conv_fwd_kernel::compute_loop_fma(int ur_w, int pad_l,
     {
         int step = 0;
         int ker_prfs = 0;
+        Label skipnorm;
         for (int ki = 0; ki < kw; ki++) {
             for (int ic = 0; ic < ic_block; ic++) {
                 int aux_kernel_offset = 0;
@@ -529,6 +538,201 @@ void jit_avx512_common_conv_fwd_kernel::compute_loop_fma(int ur_w, int pad_l,
             add(aux_reg_ker_prf, jcp.typesize_in * kw * oc_block * ic_block);
         int inp_mul = !jcp.is_1stconv ? ic_block : 1;
         add(aux_reg_inp, jcp.typesize_in * iw * inp_mul);
+        add(aux_reg_prev_src, jcp.typesize_in * iw * inp_mul);
+        if (prf_inp)
+            add(aux_reg_inp_prf, jcp.typesize_in * iw * inp_mul);
+
+        dec(reg_kj);
+        cmp(reg_kj, 0);
+        jg(kh_label, T_NEAR);
+    }
+
+    L(skip_kh_loop);
+
+    store_output(ur_w);
+}
+
+// We changed the compute_loop_fma to calculate the mean/variance for BatchNorm
+// when loading the each output channel for the first time.
+void jit_avx512_common_conv_fwd_kernel::compute_loop_fma_OC_FIRST(int ur_w, int pad_l,
+        int pad_r)
+{
+    bool prf_ker = true;
+    bool prf_inp = true;
+    int iw = jcp.iw;
+    int ih = jcp.ih;
+    int kw = jcp.kw;
+    int stride_w = jcp.stride_w;
+    int ic_block = jcp.ic_block;
+    int oc_block = jcp.oc_block;
+    int nb_oc_block = jcp.nb_oc_blocking;
+    Label kh_label;
+
+    int ker_pipeline_depth = 4;
+    assert(ker_reg_base_idx + ker_pipeline_depth <= 32);
+    assert(oc_block >= ker_pipeline_depth);
+
+    int num_ker_loads = ic_block * nb_oc_block * kw;
+    const int simd_w = 16;
+    int num_ker_prfs = prf_ker ? num_ker_loads : 0;
+    int num_inp_prfs = prf_inp ?
+            ur_w * nstl::min(kw, stride_w) + nstl::max(0, kw - stride_w) :
+            0;
+    if (jcp.is_1stconv && prf_inp) {
+        num_inp_prfs = div_up(num_inp_prfs, simd_w) * ic_block;
+    }
+    int num_prfs = num_ker_prfs + num_inp_prfs;
+    int num_fmas = num_ker_loads * ur_w;
+    int prf_inst_spacing
+            = (prf_ker || prf_inp) ? nstl::max(1, num_fmas / num_prfs) : 1;
+    int prf_inst_trigger = (num_fmas % prf_inst_spacing) / 2;
+
+    mov(reg_inp, EVEX_compress_addr(rsp, inp));
+    mov(aux_reg_inp, reg_inp);
+    mov(reg_prev_src, EVEX_compress_addr(rsp, prev_src));
+    mov(aux_reg_prev_src, reg_prev_src);
+    mov(reg_ker, EVEX_compress_addr(rsp, ker));
+    mov(aux_reg_ker, reg_ker);
+
+    prepare_output(ur_w);
+
+    mov(aux_reg_inp_prf, reg_inp_prf);
+    mov(aux_reg_ker_prf, reg_ker_prf);
+    mov(reg_kj, reg_kh);
+    Label skip_kh_loop;
+    if (jcp.kh <= jcp.t_pad) {
+        cmp(reg_kj, 0);
+        je(skip_kh_loop, T_NEAR);
+    }
+    align(16);
+    L(kh_label);
+    {
+        int step = 0;
+        int ker_prfs = 0;
+        Label skipnorm;
+        for (int ki = 0; ki < kw; ki++) {
+            for (int ic = 0; ic < ic_block; ic++) {
+                int aux_kernel_offset = 0;
+                if (step == 0) {
+                    for (int i = 0; i < ker_pipeline_depth; i++) {
+                        aux_kernel_offset = get_kernel_offset(ki, ic, 0, i);
+                        vmovups(zmm_ker(i), EVEX_compress_addr(
+                                    aux_reg_ker, aux_kernel_offset));
+                    }
+                } else if (step < num_ker_loads - ker_pipeline_depth + 1) {
+                    int load_offset = ker_pipeline_depth - 1;
+                    int ker_load_reg_idx
+                        = (step + load_offset) % ker_pipeline_depth;
+                    aux_kernel_offset = get_kernel_offset(ki,ic,0,load_offset);
+                    vmovups(zmm_ker(ker_load_reg_idx),
+                            EVEX_compress_addr(aux_reg_ker, aux_kernel_offset));
+                }
+
+                bool ker_prf_inserted = false;
+                Zmm zmm_kernel = zmm_ker(step % ker_pipeline_depth);
+                int j_start = get_ow_start(ki, pad_l);
+                int j_end = get_ow_end(ur_w, ki, pad_r);
+                for (int j = j_start; j < j_end; j++) {
+                    int aux_input_offset = get_input_offset(ki, ic, j, pad_l);
+
+                    if ((ic == 0) && (!jcp.is_1stconv))
+                    {
+                        bool cond_ta1 = (ki == 0);
+                        bool cond_ta2 = ((ki != (kw - stride_w)) && (j == j_end - 1));
+                        bool cond_ta3 = (j == j_end - 1);
+
+                        bool cond1_t1 = ((pad_l > 0) && (pad_r > 0));
+                        bool cond1_1  = cond1_t1 && cond_ta1;
+                        bool cond1_2  = cond1_t1 && !cond_ta1 && cond_ta2;
+                        bool cond2_t1 = ((pad_l > 0) && (pad_r == 0));
+                        bool cond2_1  = cond2_t1 && cond_ta1;
+                        bool cond2_2  = cond2_t1 && !cond_ta1 && cond_ta3;
+
+                        bool cond3_t1 = ((pad_l == 0) && (pad_r == 0));
+                        bool cond3_1  = cond3_t1 && cond_ta1;
+                        bool cond3_2  = cond3_t1 && !cond_ta1 && cond_ta3;
+
+                        //r_pad && tail
+                        bool cond4_t1 = ((pad_l == 0) && (pad_r > 0));
+                        bool cond4_1  = cond4_t1 && cond_ta1;
+                        bool cond4_2  = cond4_t1 && !cond_ta1 && cond_ta2;
+
+                        bool cond     = cond1_1 || cond1_2 || cond2_1 || cond2_2 ||
+                            cond3_1 || cond3_2 || cond4_1 || cond4_2;
+
+                        if (cond) {
+                            Label no_norm;
+                            Label oh_first;
+                            mov(reg_oh_second_flags, EVEX_compress_addr(rsp, oh_second_flags));
+                            test(reg_oh_second_flags, FLAG_OH_SECOND);
+                            jz(oh_first, T_NEAR);
+
+                            cmp(reg_kj, 1);
+                            jne(no_norm, T_NEAR);
+
+                            L(oh_first);
+
+                            const unsigned char _cmp_lt_os = 1;
+                            vmovntdqa(z, EVEX_compress_addr(aux_reg_prev_src, aux_input_offset, false));
+                            vsubps(z, z, zmean);
+                            vmulps(z, z, zsqrtvar);
+                            vfmadd213ps(z, zgamma, zbeta);
+                            vcmpps(vmask, z, zmm_zero2, _cmp_lt_os);
+                            vmulps(z | vmask, z, zmm_zero2);
+                            vmovups(EVEX_compress_addr(aux_reg_inp, aux_input_offset, false), z);
+                            L(no_norm);
+                        }
+                    }
+
+                    vfmadd231ps(zmm_out(j, 0), zmm_kernel,
+                                EVEX_compress_addr(
+                                aux_reg_inp, aux_input_offset, true));
+
+                    int fma_idx = step * ur_w + j;
+                    int prf_slot_idx = fma_idx / prf_inst_spacing;
+                    if (fma_idx % prf_inst_spacing == prf_inst_trigger) {
+                        if (prf_ker && !ker_prf_inserted
+                               && ker_prfs < num_ker_prfs) {
+                            int ker_prf_offset
+                                = jcp.typesize_in * ker_prfs * jcp.oc_block;
+                            mic_prefetcht2(EVEX_compress_addr(
+                                        aux_reg_ker_prf, ker_prf_offset));
+                            ker_prf_inserted = true;
+                            ker_prfs++;
+                        } else if (prf_inp) {
+                            int inp_prf_idx = prf_slot_idx - ker_prfs;
+                                if (inp_prf_idx < num_inp_prfs) {
+                                    int inp_prf_stride = nstl::max(kw, stride_w);
+                                    int inp_prf_offset;
+                                    if (!jcp.is_1stconv) {
+                                        inp_prf_offset
+                                            = ic_block * jcp.typesize_in
+                                            * ((inp_prf_idx / kw)
+                                                    * inp_prf_stride
+                                                    + (inp_prf_idx % kw));
+                                    } else {
+                                        int ic_prf_stride = jcp.typesize_in*iw*ih;
+                                        int iw_prf_stride = jcp.typesize_in*simd_w;
+                                        inp_prf_offset = ((inp_prf_idx / ic_block)
+                                                * iw_prf_stride
+                                                + (inp_prf_idx % ic_block)
+                                                * ic_prf_stride);
+                                    }
+                                    mic_prefetcht0(EVEX_compress_addr(
+                                                aux_reg_inp_prf, inp_prf_offset));
+                                }
+                        }
+                    }
+                }
+                step++;
+            }
+        }
+        add(aux_reg_ker, jcp.typesize_in * kw * oc_block * ic_block);
+        if (prf_ker)
+            add(aux_reg_ker_prf, jcp.typesize_in * kw * oc_block * ic_block);
+        int inp_mul = !jcp.is_1stconv ? ic_block : 1;
+        add(aux_reg_inp, jcp.typesize_in * iw * inp_mul);
+        add(aux_reg_prev_src, jcp.typesize_in * iw * inp_mul);
         if (prf_inp)
             add(aux_reg_inp_prf, jcp.typesize_in * iw * inp_mul);
 
@@ -623,7 +827,21 @@ void jit_avx512_common_conv_fwd_kernel::compute_loop(int ur_w,
         else
             compute_loop_4fma(ur_w, pad_l, pad_r);
     else if (jcp.ver == ver_fma)
+    {
+        Label skipnorm;
+        Label donenorm;
+        if (!jcp.is_1stconv) {
+            mov(reg_norm_flags, EVEX_compress_addr(rsp, norm_flags));
+            test(reg_norm_flags, FLAG_OC_FIRST);
+            jz(skipnorm, T_NEAR);
+            compute_loop_fma_OC_FIRST(ur_w, pad_l, pad_r);
+            jmp(donenorm, T_NEAR);
+        }
+
+        L(skipnorm);
         compute_loop_fma(ur_w, pad_l, pad_r);
+        L(donenorm);
+    }
     else
         assert(!"unknown convolution version");
 }
@@ -646,9 +864,49 @@ void jit_avx512_common_conv_fwd_kernel::generate()
     int out_shift = jcp.typesize_out * (ur_w * oc_block);
 
     preamble();
-    mov(reg_inp, ptr[param1 + GET_OFF(src)]);
+    sub(rsp, stack_space_needed);
+    mov(reg_inp_tmp, ptr[param1 + GET_OFF(src)]);
+    mov(EVEX_compress_addr(rsp, inp), reg_inp_tmp);
+    mov(reg_norm_flags, ptr[param1 + GET_OFF(flags)]);
     mov(reg_out, ptr[param1 + GET_OFF(dst)]);
-    mov(reg_ker, ptr[param1 + GET_OFF(filt)]);
+
+    mov(reg_ker_tmp, ptr[param1 + GET_OFF(filt)]);
+    mov(EVEX_compress_addr(rsp, ker), reg_ker_tmp);
+
+    Label no_norm;
+    mov(reg_norm_flags_tmp, ptr[param1 + GET_OFF(flags)]);
+    mov(EVEX_compress_addr(rsp, norm_flags), reg_norm_flags_tmp);
+    test(reg_norm_flags_tmp, FLAG_OC_FIRST);
+    jz(no_norm, T_NEAR);
+
+    chan_data_offt = jcp.ic * sizeof(float);
+
+    mov(reg_prev_mean_tmp, ptr[param1 + GET_OFF(prev_mean)]);
+    vmovups(zmean, zword[reg_prev_mean_tmp]);
+
+    mov(reg_prev_var_tmp, ptr[param1 + GET_OFF(prev_var)]);
+    vmovups(zsqrtvar, zword[reg_prev_var_tmp]);
+
+    mov(reg_scale_shift_tmp, ptr[param1 + GET_OFF(scale_shift)]);
+    vmovups(zgamma, zword[reg_scale_shift_tmp]);
+    vmovups(zbeta, zword[reg_scale_shift_tmp + chan_data_offt]);
+
+    mov(reg_prev_src_tmp, ptr[param1 + GET_OFF(prev_src)]);
+    mov(EVEX_compress_addr(rsp, prev_src), reg_prev_src_tmp);
+
+    uni_vbroadcastss(vone, zword[param1 + GET_OFF(one)]);
+    uni_vbroadcastss(veps, zword[param1 + GET_OFF(eps)]);
+    vpxord(zmm_zero2, zmm_zero2, zmm_zero2);
+
+    uni_vaddps(zsqrtvar, zsqrtvar, veps);
+    vsqrtps(zsqrtvar, zsqrtvar);
+    vdivps(zsqrtvar, vone, zsqrtvar);
+
+    mov(reg_oh_second_flags_tmp, ptr[param1 + GET_OFF(oh_second_flags)]);
+    mov(EVEX_compress_addr(rsp, oh_second_flags), reg_oh_second_flags_tmp);
+
+    L(no_norm);
+
     mov(reg_ker_prf, ptr[param1 + GET_OFF(filt_prf)]);
     mov(reg_kh, ptr[param1 + GET_OFF(kh_padding)]);
 
@@ -669,7 +927,12 @@ void jit_avx512_common_conv_fwd_kernel::generate()
             add(reg_inp_prf, inp_shift_pad);
             add(reg_out_prf, out_shift);
             compute_loop(ur_w, l_pad, r_pad1);
+            mov(reg_inp, EVEX_compress_addr(rsp, inp));
             add(reg_inp, inp_shift_pad);
+            mov(EVEX_compress_addr(rsp, inp), reg_inp);
+            mov(reg_prev_src, EVEX_compress_addr(rsp, prev_src));
+            add(reg_prev_src, inp_shift_pad);
+            mov(EVEX_compress_addr(rsp, prev_src), reg_prev_src);
             add(reg_out, out_shift);
             if (ur_w_tail != 0) {
                 add(reg_inp_prf, inp_shift);
@@ -682,7 +945,12 @@ void jit_avx512_common_conv_fwd_kernel::generate()
                 add(reg_inp_prf, inp_shift_pad);
                 add(reg_out_prf, out_shift);
                 compute_loop(ur_w, l_pad, 0);
+                mov(reg_inp, EVEX_compress_addr(rsp, inp));
                 add(reg_inp, inp_shift_pad);
+                mov(EVEX_compress_addr(rsp, inp), reg_inp);
+                mov(reg_prev_src, EVEX_compress_addr(rsp, prev_src));
+                add(reg_prev_src, inp_shift_pad);
+                mov(EVEX_compress_addr(rsp, prev_src), reg_prev_src);
                 add(reg_out, out_shift);
                 inc(reg_oi);
             }
@@ -695,7 +963,12 @@ void jit_avx512_common_conv_fwd_kernel::generate()
                     add(reg_inp_prf, inp_shift);
                     add(reg_out_prf, out_shift);
                     compute_loop(ur_w, 0, 0);
+                    mov(reg_inp, EVEX_compress_addr(rsp, inp));
                     add(reg_inp, inp_shift);
+                    mov(EVEX_compress_addr(rsp, inp), reg_inp);
+                    mov(reg_prev_src, EVEX_compress_addr(rsp, prev_src));
+                    add(reg_prev_src, inp_shift);
+                    mov(EVEX_compress_addr(rsp, prev_src), reg_prev_src);
                     add(reg_out, out_shift);
                     inc(reg_oi);
                     cmp(reg_oi, n_oi);
@@ -706,7 +979,12 @@ void jit_avx512_common_conv_fwd_kernel::generate()
                 add(reg_inp_prf, inp_shift);
                 add(reg_out_prf, out_shift);
                 compute_loop(ur_w, 0, r_pad1);
+                mov(reg_inp, EVEX_compress_addr(rsp, inp));
                 add(reg_inp, inp_shift);
+                mov(EVEX_compress_addr(rsp, inp), reg_inp);
+                mov(reg_prev_src, EVEX_compress_addr(rsp, prev_src));
+                add(reg_prev_src, inp_shift);
+                mov(EVEX_compress_addr(rsp, prev_src), reg_prev_src);
                 add(reg_out, out_shift);
             }
             if (ur_w_tail != 0) {
@@ -717,6 +995,7 @@ void jit_avx512_common_conv_fwd_kernel::generate()
         }
     }
 
+    add(rsp, stack_space_needed);
     postamble();
 }
 
@@ -764,7 +1043,8 @@ status_t jit_avx512_common_conv_fwd_kernel::init_conf(jit_conv_conf_t &jcp,
     const memory_desc_wrapper dst_d(&dst_pd);
     const memory_desc_wrapper bias_d(&bias_pd);
 
-    const int regs = 28;
+    // We changed the number of regs to get registers for BN recombination.
+    const int regs = 20;
     const bool with_groups = weights_d.ndims() == src_d.ndims() + 1;
 
     jcp = zero<decltype(jcp)>();
@@ -1008,7 +1288,7 @@ void jit_avx512_common_conv_bwd_data_kernel_f32::store_output(int ur_w)
 {
     Label no_update_label;
 
-    mov(reg_channel, ptr[param + GET_OFF(channel)]);
+    mov(reg_channel, EVEX_compress_addr(rsp, channel));
     cmp(reg_channel, 0);
     je(no_update_label, T_NEAR);
     for (int k = 0; k < jcp.nb_ic_blocking; k++) {
@@ -1021,6 +1301,49 @@ void jit_avx512_common_conv_bwd_data_kernel_f32::store_output(int ur_w)
     }
 
     L(no_update_label);
+
+    // calculate gamma and beta for BatchNorm layers within DenseNet's Composite Layers (CPL) 
+    // before storing output feature maps. 
+    Label no_GB;
+    mov(reg_flag_oc_last, EVEX_compress_addr(rsp, flag_oc_last));
+    test(reg_flag_oc_last, FLAG_OC_LAST);
+    jz(no_GB, T_NEAR);
+
+    mov(reg_coff    , EVEX_compress_addr(rsp, coff));
+    mov(reg_rbuf1   , EVEX_compress_addr(rsp, rbuf1));
+    mov(reg_rbuf2   , EVEX_compress_addr(rsp, rbuf2));
+
+    const unsigned char _cmp_lt_os = 0;
+    vpxord(zmm_zero, zmm_zero, zmm_zero);
+
+    for (int k = 0; k < jcp.nb_ic_blocking; k++) {
+        vmovups(zd_gamma, zword[reg_rbuf1 + reg_coff * 4 + k * 64]);
+        vmovups(zd_beta , zword[reg_rbuf2 + reg_coff * 4 + k * 64]);
+        mov(reg_mean    , EVEX_compress_addr(rsp, mean));
+        vmovups(zmean   , zword[reg_mean  + reg_coff * 4 + k * 64]);
+
+        for (int j = 0; j < ur_w; j++) {
+            Zmm zmm = zmm_out(j, k);
+            int aux_src_offset
+                = typesize * (k * jcp.ih * jcp.iw + j) * jcp.ic_block;
+            mov(reg_relu_src, EVEX_compress_addr(rsp, relu_src));
+            vmovups(zrelu_src, zword[reg_relu_src + aux_src_offset]);
+            vcmpps(vmask, zrelu_src, zmm_zero, _cmp_lt_os);
+            vmulps(zmm | vmask, zmm, zmm_zero);
+
+            mov(reg_bn_src, EVEX_compress_addr(rsp, bn_src));
+            vmovups(zbn_src, zword[reg_bn_src + aux_src_offset]);
+            uni_vpxor(ztmp, ztmp, ztmp);
+            vsubps(ztmp, zmean, zbn_src);
+            vfnmadd231ps(zd_gamma, ztmp, zmm);
+            uni_vaddps(zd_beta, zd_beta, zmm);
+        }
+        vmovups(zword[reg_rbuf1 + reg_coff * 4 + k * 64], zd_gamma);
+        vmovups(zword[reg_rbuf2 + reg_coff * 4 + k * 64], zd_beta);
+    }
+
+    L(no_GB);
+
     for (int k = 0; k < jcp.nb_ic_blocking; k++) {
         for (int j = 0; j < ur_w; j++) {
             Zmm zmm = zmm_out(j, k);
@@ -1287,10 +1610,14 @@ void jit_avx512_common_conv_bwd_data_kernel_f32::compute_loop_fma(int ur_w,
 
     prepare_output(ur_w);
 
+    mov(reg_dst, EVEX_compress_addr(rsp, dst));
     mov(aux_reg_dst, reg_dst);
+    mov(reg_ker, EVEX_compress_addr(rsp, ker));
     mov(aux_reg_ker, reg_ker);
 
+    mov(reg_dst_prf, EVEX_compress_addr(rsp, dst_prf));
     mov(aux_reg_dst_prf, reg_dst_prf);
+    mov(reg_ker_prf, EVEX_compress_addr(rsp, ker_prf));
     mov(aux_reg_ker_prf, reg_ker_prf);
 
     mov(reg_kj, reg_kh);
@@ -1407,14 +1734,68 @@ void jit_avx512_common_conv_bwd_data_kernel_f32::generate()
 
     preamble();
 
-    mov(reg_src, ptr[param + GET_OFF(src)]);
-    mov(reg_dst, ptr[param + GET_OFF(dst)]);
-    mov(reg_ker, ptr[param + GET_OFF(filt)]);
+    sub(rsp, stack_space_needed);
 
-    mov(reg_kh, ptr[param + GET_OFF(kh_padding)]);
+    mov(reg_flag_oc_last_tmp, ptr[param + GET_OFF(flag_oc_last)]);
+    mov(EVEX_compress_addr(rsp, flag_oc_last), reg_flag_oc_last_tmp);
+    mov(reg_flag_last_tmp, ptr[param + GET_OFF(flag_last)]);
+    mov(EVEX_compress_addr(rsp, flag_last), reg_flag_last_tmp);
+    mov(reg_coff_tmp, ptr[param + GET_OFF(coff)]);
+    mov(EVEX_compress_addr(rsp, coff), reg_coff_tmp);
+    mov(reg_rbuf1_tmp, ptr[param + GET_OFF(rbuf1)]);
+    mov(EVEX_compress_addr(rsp, rbuf1), reg_rbuf1_tmp);
+    mov(reg_rbuf2_tmp, ptr[param + GET_OFF(rbuf2)]);
+    mov(EVEX_compress_addr(rsp, rbuf2), reg_rbuf2_tmp);
+    mov(reg_bn_src_tmp, ptr[param + GET_OFF(bn_src)]);
+    mov(EVEX_compress_addr(rsp, bn_src), reg_bn_src_tmp);
+    mov(reg_relu_src_tmp, ptr[param + GET_OFF(relu_src)]);
+    mov(EVEX_compress_addr(rsp, relu_src), reg_relu_src_tmp);
+    mov(reg_mean_tmp, ptr[param + GET_OFF(bn_mean)]);
+    mov(EVEX_compress_addr(rsp, mean), reg_mean_tmp);
+
+    mov(reg_dst_tmp, ptr[param + GET_OFF(dst)]);
+    mov(EVEX_compress_addr(rsp, dst), reg_dst_tmp);
+    mov(reg_ker_tmp, ptr[param + GET_OFF(filt)]);
+    mov(EVEX_compress_addr(rsp, ker), reg_ker_tmp);
+    mov(reg_dst_prf_tmp, ptr[param + GET_OFF(dst_prf)]);
+    mov(EVEX_compress_addr(rsp, dst_prf), reg_dst_prf_tmp);
+    mov(reg_ker_prf_tmp, ptr[param + GET_OFF(filt_prf)]);
+    mov(EVEX_compress_addr(rsp, ker_prf), reg_ker_prf_tmp);
+    mov(reg_channel_tmp, ptr[param + GET_OFF(channel)]);
+    mov(EVEX_compress_addr(rsp, channel), reg_channel_tmp);
+
+    // for reduction
+    mov(reg_rbuf1_base_tmp, ptr[param + GET_OFF(rbuf1_base)]);
+    mov(EVEX_compress_addr(rsp, rbuf1_base), reg_rbuf1_base_tmp);
+    mov(reg_rbuf2_base_tmp, ptr[param + GET_OFF(rbuf2_base)]);
+    mov(EVEX_compress_addr(rsp, rbuf2_base), reg_rbuf2_base_tmp);
+    mov(reg_diff_gamma_tmp, ptr[param + GET_OFF(diff_gamma)]);
+    mov(EVEX_compress_addr(rsp, diff_gamma), reg_diff_gamma_tmp);
+    mov(reg_diff_beta_tmp, ptr[param + GET_OFF(diff_beta)]);
+    mov(EVEX_compress_addr(rsp, diff_beta), reg_diff_beta_tmp);
+    mov(reg_ithr_tmp, ptr[param + GET_OFF(ithr)]);
+    mov(EVEX_compress_addr(rsp, ithr), reg_ithr_tmp);
+    mov(reg_nthr_tmp, ptr[param + GET_OFF(nthr)]);
+    mov(EVEX_compress_addr(rsp, nthr), reg_nthr_tmp);
+    mov(reg_chan_size_tmp, ptr[param + GET_OFF(chan_size)]);
+    mov(EVEX_compress_addr(rsp, chan_size), reg_chan_size_tmp);
+    mov(reg_barrier_tmp, ptr[param + GET_OFF(barrier)]);
+    mov(EVEX_compress_addr(rsp, barrier), reg_barrier_tmp);
+    mov(reg_coff_max_tmp, ptr[param + GET_OFF(coff_max)]);
+    mov(EVEX_compress_addr(rsp, coff_max), reg_coff_max_tmp);
+    mov(reg_base_coff_tmp, ptr[param + GET_OFF(base_coff)]);
+    mov(EVEX_compress_addr(rsp, base_coff), reg_base_coff_tmp);
+    mov(reg_var_tmp, ptr[param + GET_OFF(bn_var)]);
+    mov(EVEX_compress_addr(rsp, var), reg_var_tmp);
+    mov(reg_one_tmp, ptr[param + GET_OFF(one)]);
+    mov(EVEX_compress_addr(rsp, one), reg_one_tmp);
+    mov(reg_eps_tmp, ptr[param + GET_OFF(eps)]);
+    mov(EVEX_compress_addr(rsp, eps), reg_eps_tmp);
+
+
+    mov(reg_src, ptr[param + GET_OFF(src)]);
     mov(reg_src_prf, ptr[param + GET_OFF(src_prf)]);
-    mov(reg_dst_prf, ptr[param + GET_OFF(dst_prf)]);
-    mov(reg_ker_prf, ptr[param + GET_OFF(filt_prf)]);
+    mov(reg_kh, ptr[param + GET_OFF(kh_padding)]);
 
     int l_overflow = nstl::max(0, ((kw - 1) - l_pad) / stride_w);
     int r_pad      = nstl::max(0, (stride_w * (ow - 1) + kw - iw - l_pad));
@@ -1430,9 +1811,19 @@ void jit_avx512_common_conv_bwd_data_kernel_f32::generate()
     } else if (n_oi == 0) {
         compute_loop(ur_w, l_overflow, r_overflow1);
         add(reg_src, src_shift);
+        mov(reg_relu_src, EVEX_compress_addr(rsp, relu_src));
+        add(reg_relu_src, src_shift);
+        mov(EVEX_compress_addr(rsp, relu_src), reg_relu_src);
+        mov(reg_bn_src, EVEX_compress_addr(rsp, bn_src));
+        add(reg_bn_src, src_shift);
+        mov(EVEX_compress_addr(rsp, bn_src), reg_bn_src);
+        mov(reg_dst, EVEX_compress_addr(rsp, dst));
         add(reg_dst, dst_shift);
+        mov(EVEX_compress_addr(rsp, dst), reg_dst);
         add(reg_src_prf, src_shift);
+        mov(reg_dst_prf, EVEX_compress_addr(rsp, dst_prf));
         add(reg_dst_prf, dst_shift);
+        mov(EVEX_compress_addr(rsp, dst_prf), reg_dst_prf);
         if (ur_w_tail != 0)
             compute_loop(ur_w_tail, 0, r_overflow);
     } else {
@@ -1440,9 +1831,19 @@ void jit_avx512_common_conv_bwd_data_kernel_f32::generate()
         if (l_overflow > 0) {
             compute_loop(ur_w, l_overflow, 0);
             add(reg_src, src_shift);
+            mov(reg_relu_src, EVEX_compress_addr(rsp, relu_src));
+            add(reg_relu_src, src_shift);
+            mov(EVEX_compress_addr(rsp, relu_src), reg_relu_src);
+            mov(reg_bn_src, EVEX_compress_addr(rsp, bn_src));
+            add(reg_bn_src, src_shift);
+            mov(EVEX_compress_addr(rsp, bn_src), reg_bn_src);
+            mov(reg_dst, EVEX_compress_addr(rsp, dst));
             add(reg_dst, dst_shift);
+            mov(EVEX_compress_addr(rsp, dst), reg_dst);
             add(reg_src_prf, src_shift);
+            mov(reg_dst_prf, EVEX_compress_addr(rsp, dst_prf));
             add(reg_dst_prf, dst_shift);
+            mov(EVEX_compress_addr(rsp, dst_prf), reg_dst_prf);
 
             inc(reg_oi);
         }
@@ -1452,9 +1853,19 @@ void jit_avx512_common_conv_bwd_data_kernel_f32::generate()
             L(ow_loop_label); {
                 compute_loop(ur_w, 0, 0);
                 add(reg_src, src_shift);
+                mov(reg_relu_src, EVEX_compress_addr(rsp, relu_src));
+                add(reg_relu_src, src_shift);
+                mov(EVEX_compress_addr(rsp, relu_src), reg_relu_src);
+                mov(reg_bn_src, EVEX_compress_addr(rsp, bn_src));
+                add(reg_bn_src, src_shift);
+                mov(EVEX_compress_addr(rsp, bn_src), reg_bn_src);
+                mov(reg_dst, EVEX_compress_addr(rsp, dst));
                 add(reg_dst, dst_shift);
+                mov(EVEX_compress_addr(rsp, dst), reg_dst);
                 add(reg_src_prf, src_shift);
+                mov(reg_dst_prf, EVEX_compress_addr(rsp, dst_prf));
                 add(reg_dst_prf, dst_shift);
+                mov(EVEX_compress_addr(rsp, dst_prf), reg_dst_prf);
 
                 inc(reg_oi);
                 cmp(reg_oi, n_oi);
@@ -1464,14 +1875,81 @@ void jit_avx512_common_conv_bwd_data_kernel_f32::generate()
         if (r_overflow1 > 0) {
             compute_loop(ur_w, 0, r_overflow1);
             add(reg_src, src_shift);
+            mov(reg_relu_src, EVEX_compress_addr(rsp, relu_src));
+            add(reg_relu_src, src_shift);
+            mov(EVEX_compress_addr(rsp, relu_src), reg_relu_src);
+            mov(reg_bn_src, EVEX_compress_addr(rsp, bn_src));
+            add(reg_bn_src, src_shift);
+            mov(EVEX_compress_addr(rsp, bn_src), reg_bn_src);
+            mov(reg_dst, EVEX_compress_addr(rsp, dst));
             add(reg_dst, dst_shift);
+            mov(EVEX_compress_addr(rsp, dst), reg_dst);
             add(reg_src_prf, src_shift);
+            mov(reg_dst_prf, EVEX_compress_addr(rsp, dst_prf));
             add(reg_dst_prf, dst_shift);
+            mov(EVEX_compress_addr(rsp, dst_prf), reg_dst_prf);
         }
         if (ur_w_tail != 0) {
             compute_loop(ur_w_tail, 0, r_overflow);
         }
     }
+
+    Label no_last;
+    mov(reg_flag_last, EVEX_compress_addr(rsp, flag_last));
+    test(reg_flag_last, FLAG_LAST);
+    jz(no_last, T_NEAR);
+
+    uni_vbroadcastss(vone, EVEX_compress_addr(rsp, one));
+    uni_vbroadcastss(veps, EVEX_compress_addr(rsp, eps));
+
+    mov(reg_rbuf1_base, EVEX_compress_addr(rsp, rbuf1_base));
+    mov(reg_rbuf2_base, EVEX_compress_addr(rsp, rbuf2_base));
+    mov(reg_diff_gamma, EVEX_compress_addr(rsp, diff_gamma));
+    mov(reg_diff_beta, EVEX_compress_addr(rsp, diff_beta));
+    mov(reg_coff_max, EVEX_compress_addr(rsp, coff_max));
+    mov(reg_nthr, EVEX_compress_addr(rsp, nthr));
+    mov(reg_ithr, EVEX_compress_addr(rsp, ithr));
+    mov(reg_var, EVEX_compress_addr(rsp, var));
+
+    Label no_mean_reduction;
+    mov(reg_barrier, EVEX_compress_addr(rsp, barrier));
+    simple_barrier::generate(*this, reg_barrier, reg_nthr);
+    {
+        cmp(reg_ithr, 0);
+        jne(no_mean_reduction);
+        mov(reg_base_coff, EVEX_compress_addr(rsp, base_coff));
+        vmovups(zsqrtvar, zword[reg_var + reg_base_coff * 4]);
+        vaddps(zsqrtvar, zsqrtvar, veps);
+        vsqrtps(zsqrtvar, zsqrtvar);
+        vdivps(zsqrtvar, vone, zsqrtvar);
+                     Label mean_reduction_channels;
+                     L(mean_reduction_channels);
+        {
+            mov(reg_roff, reg_base_coff);
+            uni_vpxor(Zmm(21), Zmm(21), Zmm(21));
+            uni_vpxor(Zmm(22), Zmm(22), Zmm(22));
+            mov(reg_ctr, reg_nthr);
+            Label mean_reduction_thrs;
+            L(mean_reduction_thrs); {
+                uni_vaddps(Zmm(21), Zmm(21), zword[reg_rbuf1_base + reg_roff * 4]);
+                uni_vaddps(Zmm(22), Zmm(22), zword[reg_rbuf2_base + reg_roff * 4]);
+                add(reg_roff, reg_coff_max);
+                sub(reg_ctr, 1);
+                jnz(mean_reduction_thrs);
+            }
+            vmulps(Zmm(21), Zmm(21), zsqrtvar);
+            uni_vmovups(zword[reg_diff_gamma + reg_base_coff * 4], Zmm(21));
+            uni_vmovups(zword[reg_diff_beta + reg_base_coff * 4], Zmm(22));
+            add(reg_base_coff, 16);
+            cmp(reg_base_coff, reg_coff_max);
+            jne(mean_reduction_channels);
+        }
+    }
+    L(no_mean_reduction);
+
+    L(no_last);
+
+    add(rsp, stack_space_needed);
 
     postamble();
 }
@@ -1561,7 +2039,8 @@ status_t jit_avx512_common_conv_bwd_data_kernel_f32::init_conf(
     if (jcp.is_1stconv)
         return status::unimplemented;
 
-    int regs = 28;
+    // We changed the number of regs to get registers for BN recombination.
+    int regs = 20;
     if (jcp.iw <= regs)
         jcp.ur_w = jcp.iw;
     else {

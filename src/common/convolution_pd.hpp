@@ -59,8 +59,27 @@ struct _convolution_fwd_pd_t: public primitive_desc_t {
     virtual const memory_pd_t *output_pd(int index = 0) const override
     { return index == 0 ? dst_pd() : nullptr; }
 
-    virtual int n_inputs() const override { return 2 + with_bias(); }
-    virtual int n_outputs() const override { return 1; }
+    virtual int n_inputs() const override { 
+        static int i = 0;
+        if (with_bias()) {
+            return 3;
+        }
+        else if (i < 2) {
+            i++;
+            return 2 + with_bias();
+        }
+        else
+            return 4 + with_bias(); 
+    }
+    virtual int n_outputs() const override { 
+        static int i = 0;
+        if (i < 2) {
+            i++;
+            return 1;
+        }
+        else
+            return 3;
+    }
 
     virtual status_t query(query_t what, int idx, void *result) const override
     {
@@ -160,8 +179,12 @@ struct convolution_bwd_data_pd_t: public primitive_desc_t {
     virtual const memory_pd_t *output_pd(int index = 0) const override
     { return index == 0 ? diff_src_pd() : nullptr; }
 
-    virtual int n_inputs() const override { return 2; }
-    virtual int n_outputs() const override { return 1; }
+    virtual int n_inputs() const override { return 8; }
+    virtual int n_outputs() const override { 
+        return 4;
+    }
+
+
 
     virtual status_t query(query_t what, int idx, void *result) const override
     {

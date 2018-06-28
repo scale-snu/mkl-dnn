@@ -855,7 +855,7 @@ mkldnn_status_t MKLDNN_API mkldnn_lrn_backward_desc_init(
 mkldnn_status_t MKLDNN_API mkldnn_batch_normalization_forward_desc_init(
         mkldnn_batch_normalization_desc_t *bnrm_desc,
         mkldnn_prop_kind_t prop_kind, const mkldnn_memory_desc_t *data_desc,
-        float epsilon, unsigned flags);
+        float epsilon, unsigned flags, bool mean_variance_fusion, bool norm_fusion);
 
 /** Initializes a batch normalization descriptor @p bnrm_desc for backward
  * propagation with respect to data and scale-shift parameters using memory
@@ -869,7 +869,7 @@ mkldnn_status_t MKLDNN_API mkldnn_batch_normalization_backward_desc_init(
         mkldnn_prop_kind_t prop_kind,
         const mkldnn_memory_desc_t *diff_data_desc,
         const mkldnn_memory_desc_t *data_desc,
-        float epsilon, unsigned flags);
+        float epsilon, unsigned flags, bool x1_gamma_beta_fusion, bool x2_gamma_beta_fusion);
 
 /** @} */
 

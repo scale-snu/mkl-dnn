@@ -493,6 +493,8 @@ typedef struct {
     mkldnn_padding_kind_t padding_kind;
     /** The accumulator data type. Initialized automatically. */
     mkldnn_data_type_t accum_data_type;
+    float *mean2;
+    float *var2;
 } mkldnn_convolution_desc_t;
 
 /** A descriptor of a element-wise operation. */
@@ -641,6 +643,11 @@ typedef struct {
     /** Batch normalization epsilon parameter. */
     float batch_norm_epsilon;
     unsigned flags;
+    /* Batch normalization fusion */
+    bool mean_variance_fusion;
+    bool norm_fusion;
+    bool x1_gamma_beta_fusion;
+    bool x2_gamma_beta_fusion;
 } mkldnn_batch_normalization_desc_t;
 
 /** A descriptor of an inner product operation. */

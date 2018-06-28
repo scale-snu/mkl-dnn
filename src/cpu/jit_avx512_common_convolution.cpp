@@ -25,6 +25,11 @@ namespace mkldnn {
 namespace impl {
 namespace cpu {
 
+#define DENSENET_MAX_CHANNEL 1024
+extern float diff_gamma[DENSENET_MAX_CHANNEL];
+extern float diff_beta[DENSENET_MAX_CHANNEL];
+extern float mean_fusion[DENSENET_MAX_CHANNEL];
+extern float var_fusion[DENSENET_MAX_CHANNEL];
 using namespace mkldnn::impl::status;
 using namespace mkldnn::impl::memory_format;
 using namespace mkldnn::impl::utils;
@@ -35,7 +40,9 @@ using jit_conv_ker_t = void (*)(jit_conv_call_s *);
 
 inline void jit_conv_ker_pipeline(jit_conv_ker_t ker, jit_conv_call_s &p,
         const void *src, const void *dst, const void *filt, const void *bias,
-        int channel, int kh_padding)
+        int channel, int kh_padding, const void *prev_src = NULL , const void *prev_mean = NULL, 
+        const void *prev_var = NULL, const void *scale_shift = NULL, int ithr=99, float one = 1.0f, 
+        float eps = 1e-5)
 {
 #define PIPELINE(field) \
     do { \
@@ -49,10 +56,71 @@ inline void jit_conv_ker_pipeline(jit_conv_ker_t ker, jit_conv_call_s &p,
     PIPELINE(bias);
     PIPELINE(channel);
     PIPELINE(kh_padding);
+    PIPELINE(prev_src);
+    PIPELINE(prev_mean);
+    PIPELINE(prev_var);
+    PIPELINE(scale_shift);
+    PIPELINE(eps);
+    PIPELINE(one);
 
     if (p.src)
         ker(&p);
 }
+
+inline void jit_conv_ker_pipeline_bwd_data(jit_conv_ker_t ker, jit_conv_call_s &p,
+     const void *src, const void *dst, const void *filt, const void *bias,
+     int channel, int kh_padding, const void *bn_src = NULL, const void *relu_src = NULL,
+     const void *bn_mean = NULL, const void *bn_var = NULL, size_t coff = 0,
+     int flag_oc_last = 0, int flag_last = 0)
+{
+#define PIPELINE(field) \
+    do { \
+        p.field = p.field ## _prf; \
+        p.field ## _prf = field; \
+    } while (0)
+
+    PIPELINE(src);
+    PIPELINE(dst);
+    PIPELINE(filt);
+    PIPELINE(bias);
+    PIPELINE(channel);
+    PIPELINE(kh_padding);
+    PIPELINE(relu_src);
+    PIPELINE(bn_src);
+    PIPELINE(bn_mean);
+    PIPELINE(bn_var);
+    PIPELINE(coff);
+    PIPELINE(flag_oc_last);
+    PIPELINE(flag_last);
+
+    if (p.src)
+        ker(&p);
+}
+inline void cacheline_memcpy(float *dst, float *src)
+{
+    __asm__ __volatile__ (
+        "mov $0, %%rax \n\t"
+        "vmovdqa64 (%0, %%rax), %%zmm17 \n\t"
+        "vmovntdq %%zmm17, 0(%1, %%rax) \n\t"
+
+        :
+        : "p" (src), "p" (dst)
+        : "%rax"
+   );
+}
+inline void cacheline_memcpy2(float *dst, float *src)
+{
+    __asm__ __volatile__ (
+        "mov $0, %%rax \n\t"
+        "vmovdqa64 (%0, %%rax), %%zmm5 \n\t"
+        "vmovntdq %%zmm5, 0(%1, %%rax) \n\t"
+
+        :
+        : "p" (src), "p" (dst)
+        : "%rax"
+    );
+}
+
 
 #define wht_blk_off(d, g, ...) \
         (conf_.with_groups() \
@@ -66,8 +134,16 @@ void _jit_avx512_common_convolution_fwd_t
 {
     auto src = reinterpret_cast<const src_data_t *>(this->input_memory(0));
     auto weights = reinterpret_cast<const wei_data_t *>(this->input_memory(1));
-    auto bias = reinterpret_cast<const dst_data_t *>(this->input_memory(2));
     auto dst = reinterpret_cast<dst_data_t *>(this->memory());
+
+    auto prev_src = reinterpret_cast<const src_data_t *>(this->input_memory(2));
+    auto scale_shift = reinterpret_cast<const src_data_t *>(this->input_memory(3));
+    auto prev_mean = reinterpret_cast<dst_data_t *>(this->memory(1));
+    auto prev_var = reinterpret_cast<dst_data_t *>(this->memory(2));
+
+    auto bias = reinterpret_cast<const dst_data_t *>(this->input_memory(2));
+    if(!conf_.with_bias())
+        bias=0;
 
     const memory_desc_wrapper src_d(conf_.src_pd());
     const memory_desc_wrapper dst_d(conf_.dst_pd());
@@ -77,6 +153,21 @@ void _jit_avx512_common_convolution_fwd_t
     const auto &jcp = kernel_->jcp;
     assert(jcp.nb_oc % jcp.nb_oc_blocking == 0);
 
+    if (!jcp.is_1stconv)
+    {
+        float * mean_fusion_tmp = mean_fusion;
+        float * var_fusion_tmp = var_fusion;
+        float * pmean_tmp = (float*)prev_mean;
+        float * pvar_tmp = (float*)prev_var;
+        for (int i=0; i < jcp.ic/16; i++) {
+            cacheline_memcpy(pmean_tmp, mean_fusion_tmp);
+            cacheline_memcpy2(pvar_tmp, var_fusion_tmp);
+            mean_fusion_tmp += 16;
+            var_fusion_tmp += 16;
+            pmean_tmp += 16;
+            pvar_tmp += 16;
+        }
+    }
 #   pragma omp parallel
     {
         int ithr = omp_get_thread_num(), nthr = omp_get_num_threads();
@@ -93,6 +184,8 @@ void _jit_avx512_common_convolution_fwd_t
         size_t dst_h_stride = dst_d.blk_off(0, 0, 1);
         size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
         size_t wht_ic_stride = wht_blk_off(weights_d, 0, 0, 1);
+
+        int flag_cnt = -1;
 
         for (int icb_l2 = 0 ; icb_l2 < jcp.nb_ic; icb_l2 += jcp.nb_ic_L2) {
             start = start_copy;
@@ -120,11 +213,15 @@ void _jit_avx512_common_convolution_fwd_t
                 auto bias_w = bias ? bias + bias_d.blk_off(g_oc) : 0;
                 auto dst_w = dst + dst_d.blk_off(n, g_ocb, oh_s);
                 auto src_w = src + src_d.blk_off(n, g_icb + icb_l2, ih_s);
+                auto prev_src_w = prev_src + src_d.blk_off(n, g_icb + icb_l2, ih_s);
                 auto wht_w = weights + wht_blk_off(weights_d, g, ocb, icb_l2);
-
+                auto prev_mean_c = prev_mean;
+                auto prev_var_c = prev_var;
+                auto scale_shift_c = scale_shift;
                 for (int icb = icb_l2;
                      icb < min(jcp.nb_ic, icb_l2 + jcp.nb_ic_L2); ++icb) {
                     auto src_c = src_w;
+                    auto prev_src_c = prev_src_w;
                     auto dst_c = dst_w;
                     for (int oj = oh_s, ij = ih_s;
                             oj < oh_e; ++oj, ij += jcp.stride_h)
@@ -134,15 +231,36 @@ void _jit_avx512_common_convolution_fwd_t
                         int kh_padding = nstl::max(0,
                             jcp.kh - i_t_overflow - i_b_overflow);
 
+                        if (occ == 0 && (flag_cnt % jcp.oh) != jcp.oh - 1)
+                        {
+                            if (!jcp.is_1stconv) {
+                                par_conv.flags = FLAG_OC_FIRST;
+                            }
+                        }
+                        else
+                        {
+                            par_conv.flags = FLAG_OC_LAST;
+                        }
+                        if ((flag_cnt % jcp.oh) != 0)
+                            par_conv.oh_second_flags = FLAG_OH_SECOND;
+                        else
+                            par_conv.oh_second_flags = ~FLAG_OH_SECOND;
+
                         jit_conv_ker_pipeline(kernel_->jit_ker, par_conv,
                             src_c + i_t_overflow * src_h_stride,
                             dst_c, wht_w + i_t_overflow * wht_h_stride,
-                            bias_w, icb, kh_padding);
+                            bias_w, icb, kh_padding, prev_src_c + i_t_overflow * src_h_stride, prev_mean_c, prev_var_c, scale_shift_c, ithr );
 
                         src_c += src_h_stride * jcp.stride_h;
+                        prev_src_c += src_h_stride * jcp.stride_h;
                         dst_c += dst_h_stride;
+                        flag_cnt++;
                     }
+                    prev_mean_c += 16;
+                    prev_var_c += 16;
+                    scale_shift_c += 16;
                     src_w += src_c_stride;
+                    prev_src_w += src_c_stride;
                     wht_w += wht_ic_stride;
                 }
 
@@ -158,7 +276,7 @@ void _jit_avx512_common_convolution_fwd_t
         }
 
         jit_conv_ker_pipeline(kernel_->jit_ker, par_conv,
-                src, dst, weights, bias, 0, 0);
+                src, dst, weights, bias, 0, 0, prev_src, prev_mean, prev_var, scale_shift, ithr);
     }
 }
 template struct _jit_avx512_common_convolution_fwd_t<false, data_type::f32>;
@@ -176,6 +294,12 @@ void jit_avx512_common_convolution_bwd_data_t<diff_dst_type, wei_type,
                                                        (this->input_memory(0));
     auto weights = reinterpret_cast<const wei_data_t *>(this->input_memory(1));
     auto diff_src = reinterpret_cast<diff_src_data_t*>(this->memory());
+
+    auto src = reinterpret_cast<const wei_data_t *>
+        (this->input_memory(2));
+    auto bn_src = reinterpret_cast<diff_src_data_t *>(this->memory(1));
+    auto bn_mean = reinterpret_cast<diff_src_data_t *>(this->memory(2));
+    auto bn_var = reinterpret_cast<diff_src_data_t *>(this->memory(3));
 
     const memory_desc_wrapper diff_dst_d(conf_.diff_dst_pd());
     const memory_desc_wrapper diff_src_d(conf_.diff_src_pd());
@@ -200,6 +324,50 @@ void jit_avx512_common_convolution_bwd_data_t<diff_dst_type, wei_type,
         size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
         size_t wht_oc_stride = wht_blk_off(weights_d, 0, 1);
 
+        par_conv.rbuf1 = rbuf_ + (jcp.ic * ithr);
+        par_conv.rbuf2 = par_conv.rbuf1 + (jcp.ic * nthr);
+        par_conv.rbuf1_prf = par_conv.rbuf1;
+        par_conv.rbuf2_prf = par_conv.rbuf2;
+
+        par_conv.rbuf1_base = rbuf_;
+        par_conv.rbuf2_base = par_conv.rbuf1_base + (jcp.ic * nthr);
+        par_conv.rbuf1_base_prf = par_conv.rbuf1_base;
+        par_conv.rbuf2_base_prf = par_conv.rbuf2_base;
+
+        par_conv.diff_gamma = diff_gamma;
+        par_conv.diff_beta = diff_beta;
+        par_conv.barrier = barriers_;
+        par_conv.chan_size = chan_size;
+        par_conv.one = 1.0f;
+        par_conv.eps = 1e-5;
+        par_conv.diff_gamma_prf = par_conv.diff_gamma;
+        par_conv.diff_beta_prf = par_conv.diff_beta;
+        par_conv.barrier_prf = par_conv.barrier;
+        par_conv.chan_size_prf = par_conv.chan_size;
+        par_conv.one_prf = par_conv.one;
+        par_conv.eps_prf = par_conv.eps;
+
+        par_conv.ithr = ithr;
+        par_conv.base_coff = 0;
+
+        par_conv.nthr = nthr;
+        par_conv.coff_max = jcp.ic;
+        par_conv.nthr_prf = par_conv.nthr;
+        par_conv.coff_max_prf = par_conv.coff_max;
+        par_conv.base_coff_prf = par_conv.base_coff;
+
+        for (int i = 0; i < jcp.ic; i++) {
+            (par_conv.rbuf1)[i] = 0;
+            (par_conv.rbuf2)[i] = 0;
+            if (ithr == 0) {
+                (par_conv.diff_gamma)[i] = 0;
+                (par_conv.diff_beta)[i] = 0;
+            }
+            if ((ithr == 0) && (i < 16)) {
+                (par_conv.chan_size)[i] = 1.0f * jcp.iw * jcp.ih * jcp.mb;
+            }
+        }
+
         for (int ocb_l2 = 0; ocb_l2 < jcp.nb_oc; ocb_l2 += jcp.nb_oc_L2) {
             start = start_copy;
             int n{0}, g{0}, icc{0}, ih_s{0};
@@ -217,16 +385,35 @@ void jit_avx512_common_convolution_bwd_data_t<diff_dst_type, wei_type,
                 int g_icb = g * jcp.nb_ic + icb;
                 int g_ocb = g * jcp.nb_oc;
 
+                size_t coff = icc * 16;
                 int work_rem = end - start;
                 int ih_e = ih_s + work_rem > jcp.ih ? jcp.ih : ih_s + work_rem;
 
                 auto diff_src_w = diff_src + diff_src_d.blk_off(n, g_icb);
+                auto relu_src_w = src + diff_src_d.blk_off(n, g_icb);
+                auto bn_src_w   = bn_src + diff_src_d.blk_off(n, g_icb);
                 auto diff_dst_w = diff_dst
                     + diff_dst_d.blk_off(n, g_ocb + ocb_l2);
                 auto wht_w = weights + wht_blk_off(weights_d, g, ocb_l2, icb);
 
+                int flag_oc_last = 0;
+                int flag_last = 0;
+
                 for (int ocb = ocb_l2;
-                      ocb < min(jcp.nb_oc, ocb_l2 + jcp.nb_oc_L2); ++ocb) {
+                    ocb < min(jcp.nb_oc, ocb_l2 + jcp.nb_oc_L2); ++ocb) {
+                    if (!jcp.is_1stconv) {
+                        if (ocb == min(jcp.nb_oc, ocb_l2 + jcp.nb_oc_L2) - 1)
+                            flag_oc_last = FLAG_OC_LAST;
+                        else
+                            flag_oc_last = ~FLAG_OC_LAST;
+
+                        if ((ocb == min(jcp.nb_oc, ocb_l2 + jcp.nb_oc_L2) - 1) &&
+                            (icc == (jcp.ic / 16) - 1))
+                            flag_last = FLAG_LAST;
+                        else
+                            flag_last = ~FLAG_LAST;
+                    }
+
                     for (int ij = ih_s; ij < ih_e; ++ij) {
                         int oj, k_len, k_lo;
                         if (jcp.stride_h == 1) { // fast path
@@ -257,11 +444,13 @@ void jit_avx512_common_convolution_bwd_data_t<diff_dst_type, wei_type,
                         }
                         assert(k_len >= 0);
 
-                        jit_conv_ker_pipeline(kernel_->jit_ker, par_conv,
+                        jit_conv_ker_pipeline_bwd_data(kernel_->jit_ker, par_conv,
                                 diff_src_w + ij * diff_src_h_stride,
                                 diff_dst_w + oj * diff_dst_h_stride,
                                 wht_w + k_lo * wht_h_stride,
-                                0, ocb, k_len);
+                                0, ocb, k_len, bn_src_w + ij * diff_src_h_stride,
+                                relu_src_w + ij * diff_src_h_stride, bn_mean, bn_var,
+                                coff, flag_oc_last, flag_last);
                     }
                     diff_dst_w += diff_dst_c_stride;
                     wht_w += wht_oc_stride;
@@ -278,7 +467,7 @@ void jit_avx512_common_convolution_bwd_data_t<diff_dst_type, wei_type,
             }
         }
 
-        jit_conv_ker_pipeline(kernel_->jit_ker, par_conv,
+        jit_conv_ker_pipeline_bwd_data(kernel_->jit_ker, par_conv,
                 diff_src, diff_dst, weights, 0, 0, 1);
     }
 }

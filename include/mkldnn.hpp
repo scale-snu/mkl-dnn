@@ -24,10 +24,17 @@
 #include <vector>
 #include <algorithm>
 #include <iterator>
+#include <string.h>
 
 #include "mkldnn.h"
 #endif
 
+extern mkldnn_primitive_at_t prev_input;
+extern mkldnn_primitive_at_t prev_weights;
+extern const_mkldnn_primitive_t prev_mean;
+extern const_mkldnn_primitive_t prev_variance;
+
+using namespace std;
 namespace mkldnn {
 
 /// @addtogroup cpp_api C++ API
@@ -1243,13 +1250,22 @@ struct convolution_forward: public primitive {
 
     convolution_forward(const primitive_desc &aprimitive_desc,
             const primitive::at &src, const primitive::at &weights,
-            const memory &dst) {
+            const memory &dst, bool first_conv = false) {
         mkldnn_primitive_t result;
-        mkldnn_primitive_at_t inputs[] = { src.data, weights.data };
-        const_mkldnn_primitive_t outputs[] = { dst.get() };
-        error::wrap_c_api(mkldnn_primitive_create(&result,
-                    aprimitive_desc.get(), inputs, outputs),
-                "could not create a convolution forward primitive");
+        if (first_conv == true) {
+            mkldnn_primitive_at_t inputs[] = { src.data, weights.data };
+            const_mkldnn_primitive_t outputs[] = { dst.get() };
+            error::wrap_c_api(mkldnn_primitive_create(&result,
+                        aprimitive_desc.get(), inputs, outputs),
+                    "could not create a convolution forward primitive");
+
+        } else {
+            mkldnn_primitive_at_t inputs[] = { src.data, weights.data, prev_input, prev_weights};
+            const_mkldnn_primitive_t outputs[] = { dst.get(), prev_mean, prev_variance };
+            error::wrap_c_api(mkldnn_primitive_create(&result,
+                        aprimitive_desc.get(), inputs, outputs),
+                    "could not create a convolution forward primitive");
+        }
         reset(result);
     }
 };
@@ -1348,11 +1364,11 @@ struct convolution_backward_data : public primitive {
     };
 
     convolution_backward_data(const primitive_desc &aprimitive_desc,
-            const primitive::at &diff_dst, const primitive::at &weights,
-            const memory &diff_src) {
+            const primitive::at &diff_dst, const primitive::at &weights, const primitive::at &src, const primitive::at conv_dst, const primitive::at next_mean, const primitive::at next_var, const primitive::at prev_diff_src, const primitive::at next_scale_shift,
+            const memory &diff_src, const memory &bn_src, const memory &bn_mean, const memory &bn_var) {
         mkldnn_primitive_t result;
-        mkldnn_primitive_at_t inputs[] = { diff_dst.data, weights.data  };
-        const_mkldnn_primitive_t outputs[] = { diff_src.get() };
+        mkldnn_primitive_at_t inputs[] = { diff_dst.data, weights.data, src.data, conv_dst.data, next_mean.data, next_var.data, prev_diff_src.data, next_scale_shift.data };
+        const_mkldnn_primitive_t outputs[] = { diff_src.get(), bn_src.get(), bn_mean.get(), bn_var.get()};
         error::wrap_c_api(mkldnn_primitive_create(&result,
                     aprimitive_desc.get(), inputs, outputs),
                 "could not create a convolution backward data primitive");
@@ -2128,11 +2144,11 @@ struct batch_normalization_forward : public primitive {
         mkldnn_batch_normalization_desc_t data;
         template <typename T>
         desc(prop_kind aprop_kind, const memory::desc &src_desc, T epsilon,
-                unsigned flags) {
+                unsigned flags, bool mean_variance_fusion, bool norm_fusion) {
             error::wrap_c_api(
                     mkldnn_batch_normalization_forward_desc_init(&data,
                         mkldnn::convert_to_c(aprop_kind), &src_desc.data,
-                        static_cast<float>(epsilon), flags),
+                        static_cast<float>(epsilon), flags, mean_variance_fusion, norm_fusion),
                 "could not create a batch normalization forward descriptor");
         }
     };
@@ -2245,6 +2261,10 @@ struct batch_normalization_forward : public primitive {
     batch_normalization_forward(const primitive_desc &aprimitive_desc,
             const primitive::at &src, const primitive::at &weights,
             const memory &dst, const memory &mean, const memory &variance) {
+        prev_input = src.data;
+        prev_weights = weights.data;
+        prev_mean = mean.get();
+        prev_variance = variance.get();
         mkldnn_primitive_t result;
         mkldnn_primitive_at_t inputs[] = { src.data, weights.data };
         const_mkldnn_primitive_t outputs[] = { dst.get(),
@@ -2297,12 +2317,12 @@ struct batch_normalization_backward : public primitive {
         mkldnn_batch_normalization_desc_t data;
         template <typename T>
         desc(prop_kind aprop_kind, const memory::desc &diff_data_desc,
-                const memory::desc &data_desc, T epsilon, unsigned flags) {
+                const memory::desc &data_desc, T epsilon, unsigned flags, bool x1_gamma_beta_fusion, bool x2_gamma_beta_fusion) {
             error::wrap_c_api(
                     mkldnn_batch_normalization_backward_desc_init(&data,
                         mkldnn::convert_to_c(aprop_kind),
                         &diff_data_desc.data, &data_desc.data,
-                        static_cast<float>(epsilon), flags),
+                        static_cast<float>(epsilon), flags, x1_gamma_beta_fusion, x2_gamma_beta_fusion),
                 "could not create a batch normalization backward descriptor");
         }
     };

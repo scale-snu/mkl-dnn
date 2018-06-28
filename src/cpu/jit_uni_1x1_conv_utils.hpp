@@ -78,8 +78,15 @@ struct rtus_driver_t: public jit_generator {
     struct call_params_t {
         const void *ws; /* reduced image (w/ strides = 1) */
         const void *src; /* source image (w/ non-unit strides) */
+        const void *relu_src; 
+        const void *bn_src; 
+        const void *bn_mean; 
+        const void *bn_var; 
         size_t icb;
         size_t os;
+        float eps;
+        float one;
+        float bwd_chan_size;
         size_t iw_start;
     };
 

@@ -171,7 +171,15 @@ struct jit_avx512_common_convolution_bwd_data_t: public cpu_primitive_t {
     jit_avx512_common_convolution_bwd_data_t(const pd_t *pd,
             const input_vector &inputs, const output_vector &outputs)
         : cpu_primitive_t(&conf_, inputs, outputs), conf_(*pd)
-    { kernel_ = new jit_avx512_common_conv_bwd_data_kernel_f32(conf_.jcp_); }
+    {
+        kernel_ = new jit_avx512_common_conv_bwd_data_kernel_f32(conf_.jcp_);
+        int ic = kernel_->jcp.ic;
+        int size_rbuf = 2 * omp_get_max_threads() * ic;
+        rbuf_ = (float *)malloc(size_rbuf * sizeof(float), 64);
+        chan_size = (float *)malloc(16 * sizeof(float), 64);
+        barriers_ = (barrier::ctx_t *)malloc(1 * sizeof(barrier::ctx_t), 64);
+        barrier::ctx_init(&barriers_[0]);
+    }
     ~jit_avx512_common_convolution_bwd_data_t() { delete kernel_; };
 
     typedef typename prec_traits<diff_dst_type>::type diff_dst_data_t;
@@ -193,6 +201,9 @@ private:
     void execute_backward_data();
     pd_t conf_;
     jit_avx512_common_conv_bwd_data_kernel_f32 *kernel_;
+    float *rbuf_; 
+    float *chan_size; 
+    barrier::ctx_t *barriers_; 
 };
 
 struct jit_avx512_common_convolution_bwd_weights_t: public cpu_primitive_t {
